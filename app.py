@@ -94,3 +94,263 @@ def split_into_passages(page_texts, source_name, max_chars=1100, overlap=140):
                 passages.append({
                     "source": source_name, "page": page_no, "text": current
                 })
+                current = paragraph
+
+        if current:
+            passages.append({"source": source_name, "page": page_no, "text": current})
+    return passages
+
+
+def build_index(passages, embedding_model):
+    texts = [p["text"] for p in passages]
+    vectors = embedding_model.encode(
+        texts, convert_to_numpy=True, show_progress_bar=False
+    ).astype("float32")
+    faiss.normalize_L2(vectors)
+    index = faiss.IndexFlatIP(vectors.shape[1])
+    index.add(vectors)
+    return index
+
+
+def retrieve_passages(question, passages, embedding_model, index, top_k=8):
+    if not passages:
+        return []
+
+    q_vector = embedding_model.encode(
+        [question], convert_to_numpy=True, show_progress_bar=False
+    ).astype("float32")
+    faiss.normalize_L2(q_vector)
+
+    k = min(max(top_k * 3, top_k), len(passages))
+    semantic_scores, ids = index.search(q_vector, k)
+    q_terms = query_terms(question)
+    is_comparison = bool(
+        re.search(r"\b(compare|comparison|difference|differences|versus|vs)\b", question, re.I)
+    )
+
+    candidates = []
+    for semantic_score, idx in zip(semantic_scores[0], ids[0]):
+        if idx < 0:
+            continue
+        passage = passages[int(idx)]
+        p_tokens = tokenize(passage["text"])
+        p_terms = set(p_tokens)
+        overlap_count = len(q_terms & p_terms)
+        coverage = overlap_count / max(1, len(q_terms))
+        # A small lexical boost helps exact technical terms; semantic search remains important.
+        lexical_score = coverage
+        combined = (0.72 * float(semantic_score)) + (0.28 * lexical_score)
+
+        # For comparison questions, prefer evidence that mentions both named concepts
+        # when those concepts are present in the question.
+        if is_comparison:
+            named_terms = [
+                t for t in q_terms
+                if t.upper() in {"CNN", "RNN", "LSTM", "GRU", "VIT", "DEIT"}
+            ]
+            if len(named_terms) >= 2 and all(term in p_terms for term in named_terms[:2]):
+                combined += 0.12
+
+        candidates.append({
+            "source": passage["source"],
+            "page": passage["page"],
+            "text": passage["text"],
+            "semantic_score": float(semantic_score),
+            "lexical_score": lexical_score,
+            "combined_score": combined,
+        })
+
+    # De-duplicate identical passages and return the strongest candidates.
+    unique = {}
+    for item in candidates:
+        key = (item["source"], item["page"], re.sub(r"\s+", " ", item["text"]).lower())
+        if key not in unique or item["combined_score"] > unique[key]["combined_score"]:
+            unique[key] = item
+    return sorted(unique.values(), key=lambda x: x["combined_score"], reverse=True)[:top_k]
+
+
+def split_sentences(text):
+    # Keep short bullet/table lines, which are common in project PDFs.
+    pieces = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [
+        re.sub(r"\s+", " ", piece).strip(" \t-•*")
+        for piece in pieces
+        if len(re.sub(r"\s+", " ", piece).strip(" \t-•*")) >= 18
+    ]
+
+
+def find_relevant_sentences(question, results, limit=6):
+    q_terms = query_terms(question)
+    is_comparison = bool(
+        re.search(r"\b(compare|comparison|difference|differences|versus|vs)\b", question, re.I)
+    )
+    named_terms = [
+        t for t in q_terms
+        if t.upper() in {"CNN", "RNN", "LSTM", "GRU", "VIT", "DEIT"}
+    ]
+
+    candidates = []
+    for result in results:
+        for sentence in split_sentences(result["text"]):
+            terms = set(tokenize(sentence))
+            overlap = len(q_terms & terms) / max(1, len(q_terms))
+            # Give a stronger boost to sentences containing the exact terms asked about.
+            exact_named = sum(1 for term in named_terms if term in terms)
+            score = (0.55 * overlap) + (0.30 * max(0.0, result["semantic_score"])) + (
+                0.15 * exact_named / max(1, len(named_terms))
+            )
+            if is_comparison and len(named_terms) >= 2:
+                if all(term in terms for term in named_terms[:2]):
+                    score += 0.20
+            candidates.append({
+                "source": result["source"],
+                "page": result["page"],
+                "text": sentence,
+                "score": score,
+                "overlap": overlap,
+            })
+
+    unique = {}
+    for item in candidates:
+        key = item["text"].lower()
+        if key not in unique or item["score"] > unique[key]["score"]:
+            unique[key] = item
+
+    ranked = sorted(unique.values(), key=lambda item: item["score"], reverse=True)
+    return ranked[:limit]
+
+
+def render_sources(sources, show_scores=False):
+    for n, source in enumerate(sources, start=1):
+        score_text = f" · retrieval score {source['combined_score']:.3f}" if show_scores and "combined_score" in source else ""
+        st.markdown(
+            f"**Source {n}: {source['source']} · page {source['page']}{score_text}**"
+        )
+        st.write(source["text"][:2400])
+
+
+uploaded_pdfs = st.file_uploader(
+    "Upload one or more PDF documents",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
+
+if uploaded_pdfs:
+    try:
+        all_passages = []
+        document_summary = []
+        file_fingerprints = []
+
+        with st.spinner("Reading and indexing uploaded PDFs..."):
+            for uploaded_pdf in uploaded_pdfs:
+                file_bytes = uploaded_pdf.getvalue()
+                fingerprint = hashlib.sha256(file_bytes).hexdigest()
+                file_fingerprints.append((uploaded_pdf.name, fingerprint))
+
+                page_texts, page_count = extract_pdf_text(uploaded_pdf)
+                if not page_texts:
+                    st.warning(
+                        f"No selectable text was found in **{uploaded_pdf.name}**. "
+                        "It may be a scanned PDF; OCR is not included."
+                    )
+                    continue
+
+                file_passages = split_into_passages(page_texts, uploaded_pdf.name)
+                all_passages.extend(file_passages)
+                document_summary.append({
+                    "name": uploaded_pdf.name,
+                    "pages": page_count,
+                    "passages": len(file_passages),
+                })
+
+            if not all_passages:
+                st.error("No searchable text was found in the uploaded PDFs.")
+                st.stop()
+
+            embedding_model = load_embedding_model()
+            index = build_index(all_passages, embedding_model)
+
+        total_pages = sum(item["pages"] for item in document_summary)
+        st.success(
+            f"Ready: {len(document_summary)} PDF(s) | {total_pages} total pages | "
+            f"{len(all_passages)} passages indexed"
+        )
+        with st.expander("Uploaded documents"):
+            for item in document_summary:
+                st.write(
+                    f"**{item['name']}** — {item['pages']} pages, "
+                    f"{item['passages']} passages indexed"
+                )
+
+        active_fingerprint = hashlib.sha256(
+            "|".join(f"{name}:{digest}" for name, digest in file_fingerprints).encode("utf-8")
+        ).hexdigest()
+
+        if st.session_state.get("active_pdf_fingerprint") != active_fingerprint:
+            st.session_state.messages = []
+            st.session_state.active_pdf_fingerprint = active_fingerprint
+
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                if message.get("sources"):
+                    with st.expander("Show source passages"):
+                        render_sources(message["sources"])
+
+        question = st.chat_input("Ask a question about the uploaded PDFs...")
+        if question:
+            st.session_state.messages.append({"role": "user", "content": question})
+            with st.chat_message("user"):
+                st.markdown(question)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Searching all uploaded PDFs..."):
+                    results = retrieve_passages(
+                        question, all_passages, embedding_model, index, top_k=8
+                    )
+                    relevant = find_relevant_sentences(question, results, limit=6)
+
+                # Use a conservative threshold: don't present weak matches as a definite answer.
+                best_score = relevant[0]["score"] if relevant else 0.0
+                if not results or best_score < 0.12:
+                    answer = (
+                        "I couldn't find a sufficiently relevant answer in the uploaded PDFs. "
+                        "Try using the terminology from the documents, or check the source passages below."
+                    )
+                else:
+                    answer = (
+                        "Here are the most relevant statements I found in the uploaded PDFs. "
+                        "These are extracted statements, not a newly generated explanation:\n\n"
+                    )
+                    answer += "\n\n".join(
+                        f"- {item['text']} *(Source: {item['source']}, page {item['page']})*"
+                        for item in relevant
+                    )
+                    answer += (
+                        "\n\n*If the documents do not explicitly state a comparison or conclusion, "
+                        "the app will not infer one from unrelated passages. Please verify important "
+                        "medical information with a qualified clinician.*"
+                    )
+
+                st.markdown(answer)
+                with st.expander("Show retrieved source passages"):
+                    render_sources(results, show_scores=True)
+
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+                "sources": results,
+            })
+
+    except Exception as exc:
+        st.error(
+            "The PDF could not be processed. Check that it is a text-based PDF and that "
+            "the app dependencies installed correctly."
+        )
+        st.caption(f"Technical detail: {type(exc).__name__}: {exc}")
+else:
+    st.info("Upload one or more sample/public PDFs to get started.")
+
